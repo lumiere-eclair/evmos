@@ -2,68 +2,86 @@ package keeper
 
 import (
 	"strings"
-
+	
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
-
+	
 	"github.com/tharsis/evmos/v3/contracts"
 	"github.com/tharsis/evmos/v3/x/erc20/types"
 )
 
 // RegisterCoin deploys an erc20 contract and creates the token pair for the existing cosmos coin
+// 针对现有的coin（bank里面的metadata信息）deploy erc20
+// 注册cosmos coin 信息
+// Param是gengesis里面erc20模块的params，模块通用
+// 通过metadata信息deploy erc20，然后做一些map
 func (k Keeper) RegisterCoin(ctx sdk.Context, coinMetadata banktypes.Metadata) (*types.TokenPair, error) {
 	// check if the conversion is globally enabled
 	params := k.GetParams(ctx)
 	if !params.EnableErc20 {
 		return nil, sdkerrors.Wrap(types.ErrERC20Disabled, "registration is currently disabled by governance")
 	}
-
+	
 	// prohibit denominations that contain the evm denom
+	// 代币名字不能包含evm？
 	if strings.Contains(coinMetadata.Base, "evm") {
 		return nil, sdkerrors.Wrapf(types.ErrEVMDenom, "cannot register the EVM denomination %s", coinMetadata.Base)
 	}
-
+	
 	// check if the denomination already registered
+	// 检查是否已经注册过，单纯检查store
 	if k.IsDenomRegistered(ctx, coinMetadata.Name) {
 		return nil, sdkerrors.Wrapf(types.ErrTokenPairAlreadyExists, "coin denomination already registered: %s", coinMetadata.Name)
 	}
-
+	
 	// check if the coin exists by ensuring the supply is set
+	// base必须在bank supply提供一定数量
 	if !k.bankKeeper.HasSupply(ctx, coinMetadata.Base) {
 		return nil, sdkerrors.Wrapf(
 			sdkerrors.ErrInvalidCoins,
 			"base denomination '%s' cannot have a supply of 0", coinMetadata.Base,
 		)
 	}
-
+	
 	if err := k.verifyMetadata(ctx, coinMetadata); err != nil {
 		return nil, sdkerrors.Wrapf(types.ErrInternalTokenPair, "coin metadata is invalid %s", coinMetadata.Name)
 	}
-
+	
+	// call ethermint evm module
 	addr, err := k.DeployERC20Contract(ctx, coinMetadata)
 	if err != nil {
 		return nil, sdkerrors.Wrap(err, "failed to create wrapped coin denom metadata for ERC20")
 	}
-
+	
+	// addr是erc20地址, base是denom信息，所有者是 module account - 1
 	pair := types.NewTokenPair(addr, coinMetadata.Base, true, types.OWNER_MODULE)
+	// 链上存储相关信息，token pair, denom map, erc20 map
+	// prefix 是 [1]/[3]/[2]
+	// SetTokenPair = SetKVStore(pair.id, marshal(pair))
 	k.SetTokenPair(ctx, pair)
+	// denom 和 token pair id的关系
+	// denom 是coinMetadata.Base
 	k.SetDenomMap(ctx, pair.Denom, pair.GetID())
+	// erc20地址和token pair id的关系
+	// Erc20Address是addr
 	k.SetERC20Map(ctx, common.HexToAddress(pair.Erc20Address), pair.GetID())
-
+	
 	return &pair, nil
 }
 
 // verify if the metadata matches the existing one, if not it sets it to the store
 func (k Keeper) verifyMetadata(ctx sdk.Context, coinMetadata banktypes.Metadata) error {
 	meta, found := k.bankKeeper.GetDenomMetaData(ctx, coinMetadata.Base)
+	// 没找到，就设置denom metadata
 	if !found {
 		k.bankKeeper.SetDenomMetaData(ctx, coinMetadata)
 		return nil
 	}
 	// If it already existed, Check that is equal to what is stored
+	// 如果存在，检查是否等于之前保存的信息
 	return types.EqualMetadata(meta, coinMetadata)
 }
 
@@ -74,6 +92,7 @@ func (k Keeper) DeployERC20Contract(
 	coinMetadata banktypes.Metadata,
 ) (common.Address, error) {
 	decimals := uint8(coinMetadata.DenomUnits[0].Exponent)
+	// 可能是eth的erc20某些接口调用，encode？
 	ctorArgs, err := contracts.ERC20MinterBurnerDecimalsContract.ABI.Pack(
 		"",
 		coinMetadata.Name,
@@ -83,22 +102,27 @@ func (k Keeper) DeployERC20Contract(
 	if err != nil {
 		return common.Address{}, sdkerrors.Wrapf(types.ErrABIPack, "coin metadata is invalid %s: %s", coinMetadata.Name, err.Error())
 	}
-
+	
 	data := make([]byte, len(contracts.ERC20MinterBurnerDecimalsContract.Bin)+len(ctorArgs))
+	// []byte[Bin + ctorArgs]
 	copy(data[:len(contracts.ERC20MinterBurnerDecimalsContract.Bin)], contracts.ERC20MinterBurnerDecimalsContract.Bin)
 	copy(data[len(contracts.ERC20MinterBurnerDecimalsContract.Bin):], ctorArgs)
-
+	
+	// GetSequence()获取addr的acc，然后返回acc的序号
 	nonce, err := k.accountKeeper.GetSequence(ctx, types.ModuleAddress.Bytes())
 	if err != nil {
 		return common.Address{}, err
 	}
-
+	
+	// 创建一个eth合约新地址，用module address和nonce
+	// module address = common.BytesToAddress(authtypes.NewModuleAddress(ModuleName).Bytes())
 	contractAddr := crypto.CreateAddress(types.ModuleAddress, nonce)
+	// evm deploy contract
 	_, err = k.CallEVMWithData(ctx, types.ModuleAddress, nil, data)
 	if err != nil {
 		return common.Address{}, sdkerrors.Wrapf(err, "failed to deploy contract for %s", coinMetadata.Name)
 	}
-
+	
 	return contractAddr, nil
 }
 
@@ -108,16 +132,19 @@ func (k Keeper) RegisterERC20(ctx sdk.Context, contract common.Address) (*types.
 	if !params.EnableErc20 {
 		return nil, sdkerrors.Wrap(types.ErrERC20Disabled, "registration is currently disabled by governance")
 	}
-
+	
+	// 不能被注册过
+	// 为什么通过contract address判断？
+	// 可能是通过eth里面发布的address
 	if k.IsERC20Registered(ctx, contract) {
 		return nil, sdkerrors.Wrapf(types.ErrTokenPairAlreadyExists, "token ERC20 contract already registered: %s", contract.String())
 	}
-
+	
 	metadata, err := k.CreateCoinMetadata(ctx, contract)
 	if err != nil {
 		return nil, sdkerrors.Wrap(err, "failed to create wrapped coin denom metadata for ERC20")
 	}
-
+	
 	pair := types.NewTokenPair(contract, metadata.Name, true, types.OWNER_EXTERNAL)
 	k.SetTokenPair(ctx, pair)
 	k.SetDenomMap(ctx, pair.Denom, pair.GetID())
@@ -128,25 +155,27 @@ func (k Keeper) RegisterERC20(ctx sdk.Context, contract common.Address) (*types.
 // CreateCoinMetadata generates the metadata to represent the ERC20 token on evmos.
 func (k Keeper) CreateCoinMetadata(ctx sdk.Context, contract common.Address) (*banktypes.Metadata, error) {
 	strContract := contract.String()
-
+	
 	erc20Data, err := k.QueryERC20(ctx, contract)
 	if err != nil {
 		return nil, err
 	}
-
+	
+	// bank中（genesis.json/bank）不能存在
 	_, found := k.bankKeeper.GetDenomMetaData(ctx, types.CreateDenom(strContract))
 	if found {
 		// metadata already exists; exit
 		return nil, sdkerrors.Wrap(types.ErrInternalTokenPair, "denom metadata already registered")
 	}
-
+	
 	if k.IsDenomRegistered(ctx, types.CreateDenom(strContract)) {
 		return nil, sdkerrors.Wrapf(types.ErrInternalTokenPair, "coin denomination already registered: %s", erc20Data.Name)
 	}
-
+	
 	// base denomination
+	// base = module_name + strContract
 	base := types.CreateDenom(strContract)
-
+	
 	// create a bank denom metadata based on the ERC20 token ABI details
 	// metadata name is should always be the contract since it's the key
 	// to the bank store
@@ -164,7 +193,7 @@ func (k Keeper) CreateCoinMetadata(ctx sdk.Context, contract common.Address) (*b
 		Symbol:  erc20Data.Symbol,
 		Display: base,
 	}
-
+	
 	// only append metadata if decimals > 0, otherwise validation fails
 	if erc20Data.Decimals > 0 {
 		nameSanitized := types.SanitizeERC20Name(erc20Data.Name)
@@ -177,13 +206,14 @@ func (k Keeper) CreateCoinMetadata(ctx sdk.Context, contract common.Address) (*b
 		)
 		metadata.Display = nameSanitized
 	}
-
+	
 	if err := metadata.Validate(); err != nil {
 		return nil, sdkerrors.Wrapf(err, "ERC20 token data is invalid for contract %s", strContract)
 	}
-
+	
+	// Set(denom, marshal(metadata)) in the bank store
 	k.bankKeeper.SetDenomMetaData(ctx, metadata)
-
+	
 	return &metadata, nil
 }
 
@@ -193,14 +223,14 @@ func (k Keeper) ToggleRelay(ctx sdk.Context, token string) (types.TokenPair, err
 	if len(id) == 0 {
 		return types.TokenPair{}, sdkerrors.Wrapf(types.ErrTokenPairNotFound, "token '%s' not registered by id", token)
 	}
-
+	
 	pair, found := k.GetTokenPair(ctx, id)
 	if !found {
 		return types.TokenPair{}, sdkerrors.Wrapf(types.ErrTokenPairNotFound, "token '%s' not registered", token)
 	}
-
+	
 	pair.Enabled = !pair.Enabled
-
+	
 	k.SetTokenPair(ctx, pair)
 	return pair, nil
 }
@@ -211,36 +241,36 @@ func (k Keeper) UpdateTokenPairERC20(ctx sdk.Context, erc20Addr, newERC20Addr co
 	if len(id) == 0 {
 		return types.TokenPair{}, sdkerrors.Wrapf(types.ErrInternalTokenPair, "token %s not registered", erc20Addr)
 	}
-
+	
 	pair, found := k.GetTokenPair(ctx, id)
 	if !found {
 		return types.TokenPair{}, sdkerrors.Wrapf(types.ErrTokenPairNotFound, "token '%s' not registered", erc20Addr)
 	}
-
+	
 	// Get current stored metadata
 	metadata, found := k.bankKeeper.GetDenomMetaData(ctx, pair.Denom)
 	if !found {
 		return types.TokenPair{}, sdkerrors.Wrapf(types.ErrInternalTokenPair, "could not get metadata for %s", pair.Denom)
 	}
-
+	
 	// safety check
 	if len(metadata.DenomUnits) == 0 {
 		return types.TokenPair{}, sdkerrors.Wrapf(types.ErrInternalTokenPair, "metadata denom units for %s cannot be empty", pair.Erc20Address)
 	}
-
+	
 	// Get new erc20 values
 	erc20Data, err := k.QueryERC20(ctx, newERC20Addr)
 	if err != nil {
 		return types.TokenPair{}, sdkerrors.Wrapf(types.ErrInternalTokenPair, "could not get token %s erc20Data", newERC20Addr.String())
 	}
-
+	
 	// compare metadata and ERC20 details
 	if metadata.Display != erc20Data.Name ||
 		metadata.Symbol != erc20Data.Symbol ||
 		metadata.Description != types.CreateDenomDescription(erc20Addr.String()) {
 		return types.TokenPair{}, sdkerrors.Wrapf(types.ErrInternalTokenPair, "metadata details (display, symbol, description) don't match the ERC20 details from %s ", pair.Erc20Address)
 	}
-
+	
 	// check that the denom units contain one item with the same
 	// name and decimal values as the ERC20
 	found = false
@@ -249,7 +279,7 @@ func (k Keeper) UpdateTokenPairERC20(ctx sdk.Context, erc20Addr, newERC20Addr co
 		if denomUnit.Denom != erc20Data.Name {
 			continue
 		}
-
+		
 		// once found, check it has the same exponent
 		if denomUnit.Exponent != uint32(erc20Data.Decimals) {
 			return types.TokenPair{}, sdkerrors.Wrapf(
@@ -257,12 +287,12 @@ func (k Keeper) UpdateTokenPairERC20(ctx sdk.Context, erc20Addr, newERC20Addr co
 				pair.Erc20Address, erc20Data.Decimals, denomUnit.Exponent,
 			)
 		}
-
+		
 		// break as metadata might contain denom units for higher exponents
 		found = true
 		break
 	}
-
+	
 	if !found {
 		return types.TokenPair{}, sdkerrors.Wrapf(
 			types.ErrInternalTokenPair,
@@ -270,7 +300,7 @@ func (k Keeper) UpdateTokenPairERC20(ctx sdk.Context, erc20Addr, newERC20Addr co
 			erc20Data.Name, pair.Erc20Address,
 		)
 	}
-
+	
 	// Update the metadata description with the new address
 	metadata.Description = types.CreateDenomDescription(newERC20Addr.String())
 	k.bankKeeper.SetDenomMetaData(ctx, metadata)

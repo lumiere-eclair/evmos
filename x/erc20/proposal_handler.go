@@ -12,6 +12,7 @@ import (
 
 // NewErc20ProposalHandler creates a governance handler to manage new proposal types.
 // It enables RegisterTokenPairProposal to propose a registration of token mapping
+// 提供给bank module使用的proposal handler
 func NewErc20ProposalHandler(k *keeper.Keeper) govtypes.Handler {
 	return func(ctx sdk.Context, content govtypes.Content) error {
 		switch c := content.(type) {
@@ -31,6 +32,7 @@ func NewErc20ProposalHandler(k *keeper.Keeper) govtypes.Handler {
 }
 
 func handleRegisterCoinProposal(ctx sdk.Context, k *keeper.Keeper, p *types.RegisterCoinProposal) error {
+	// 通过keeper/evm.go下的method来调用ethermint/x/evm module功能
 	pair, err := k.RegisterCoin(ctx, p.Metadata)
 	if err != nil {
 		return err

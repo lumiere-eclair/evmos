@@ -90,6 +90,8 @@ func (k Keeper) CallEVMWithData(
 	contract *common.Address,
 	data []byte,
 ) (*evmtypes.MsgEthereumTxResponse, error) {
+	// 在DeployERC20Contract中一样，获取nonce
+	// 在CallEVM中contract是已经存在的erc20 address
 	nonce, err := k.accountKeeper.GetSequence(ctx, from.Bytes())
 	if err != nil {
 		return nil, err
@@ -104,6 +106,8 @@ func (k Keeper) CallEVMWithData(
 		return nil, sdkerrors.Wrapf(sdkerrors.ErrJSONMarshal, "failled to marshal tx args: %s", err.Error())
 	}
 
+	// 估计gas，数据大小是args
+	// 细节复杂，to read
 	gasRes, err := k.evmKeeper.EstimateGas(sdk.WrapSDKContext(ctx), &evmtypes.EthCallRequest{
 		Args:   args,
 		GasCap: config.DefaultGasCap,
@@ -125,7 +129,8 @@ func (k Keeper) CallEVMWithData(
 		ethtypes.AccessList{}, // AccessList
 		true,                  // checkNonce
 	)
-
+	
+	// send tx
 	res, err := k.evmKeeper.ApplyMessage(ctx, msg, evmtypes.NewNoOpTracer(), true)
 	if err != nil {
 		return nil, err
